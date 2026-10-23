@@ -1,0 +1,25 @@
+{
+  "name": "oparax-source-monitor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Oparax's source-tracking chain, pulled out to run alone: interest to section, section to mechanism, conditional polling, article text.",
+  "engines": {
+    "node": "^22.12.0 || >=24"
+  },
+  "scripts": {
+    "demo": "tsx src/cli.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "fast-xml-parser": "^5.10.1",
+    "jsdom": "^27.0.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/jsdom": "^27",
+    "@types/node": "^24",
+    "tsx": "^4.20",
+    "typescript": "^6"
+  }
+}

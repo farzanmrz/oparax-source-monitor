@@ -1,0 +1,26 @@
+{
+  "feed": {
+    "url": "https://www.doctorofcredit.com/",
+    "prefix": null,
+    "skipSitemaps": true,
+    "note": "Doctor of Credit, one of Points Wire's sources. Its robots.txt also declares a sitemap, which discovery would pick first; this example skips sitemaps to show the feed path."
+  },
+  "sitemap": {
+    "url": "https://www.mundodeportivo.com/futbol/fc-barcelona",
+    "prefix": "/futbol/fc-barcelona",
+    "skipSitemaps": false,
+    "note": "Mundo Deportivo's FC Barcelona section, not the whole paper."
+  },
+  "listing": {
+    "url": "https://www.bbc.com/news",
+    "prefix": null,
+    "skipSitemaps": false,
+    "note": "BBC News."
+  },
+  "blocked": {
+    "url": "https://www.nytimes.com/section/business",
+    "prefix": null,
+    "skipSitemaps": false,
+    "note": "The New York Times business section, which refuses plain fetches."
+  }
+}
