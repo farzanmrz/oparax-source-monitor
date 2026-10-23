@@ -11,8 +11,6 @@ import { isArticleShapedPath, isSafeDiscoveredUrl } from "./fetch.js";
 import type { SourceSampleEntry } from "./types.js";
 import { fetchPage } from "./unlocker.js";
 
-export type { SourceSampleEntry } from "./types.js";
-
 const parser = new XMLParser({
   ignoreAttributes: false,
   attributeNamePrefix: "@_",

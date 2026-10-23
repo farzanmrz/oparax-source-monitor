@@ -3,8 +3,6 @@ import { z } from "zod";
 import { fetchSafeSource, readHtmlWithinLimit } from "./fetch.js";
 import type { SourceSampleEntry } from "./types.js";
 
-export type { SourceSampleEntry } from "./types.js";
-
 const parser = new XMLParser({
   ignoreAttributes: false,
   attributeNamePrefix: "@_",

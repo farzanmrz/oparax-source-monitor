@@ -40,9 +40,26 @@ export function articleId(url: string): string {
   return createHash("sha1").update(canonicalArticleUrl(url)).digest("hex");
 }
 
+const NAMED_ENTITIES: Record<string, string> = {
+  amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ", hellip: "…",
+  lsquo: "‘", rsquo: "’", ldquo: "“", rdquo: "”", ndash: "\u2013", mdash: "\u2014",
+};
+
+/** Feeds often carry titles with HTML entities still encoded (WordPress's `&#038;`). */
+function decodeEntities(text: string): string {
+  return text.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (match, code: string) => {
+    if (code[0] === "#") {
+      const point = code[1].toLowerCase() === "x" ? parseInt(code.slice(2), 16) : Number(code.slice(1));
+      return Number.isFinite(point) && point > 0 && point <= 0x10ffff
+        ? String.fromCodePoint(point)
+        : match;
+    }
+    return NAMED_ENTITIES[code.toLowerCase()] ?? match;
+  });
+}
+
 function cleanTitle(value: string): string {
-  const title = value
-    .replace(/<[^>]*>/g, " ")
+  const title = decodeEntities(value.replace(/<[^>]*>/g, " "))
     .replace(/\s+/g, " ")
     .trim();
   if (/[•·]\s*\d+\s*(?:min|hour|day|week|month|year)/i.test(title)) return "";
@@ -52,8 +69,10 @@ function cleanTitle(value: string): string {
     .trim();
 }
 
-function articleTitle(entry: SourceSampleEntry, document?: Document): string {
-  const candidates = [entry.title ?? ""];
+/** A listing link's text is often the whole card (headline plus summary), so for a website
+ *  source the page's own title comes first and the link text is the fallback. */
+function articleTitle(entry: SourceSampleEntry, document?: Document, preferPage = false): string {
+  const candidates = preferPage ? [] : [entry.title ?? ""];
   if (document) {
     candidates.push(...structuredArticles(document).map((node) => node.headline ?? ""));
     for (const name of ["og:title", "twitter:title"]) {
@@ -68,6 +87,7 @@ function articleTitle(entry: SourceSampleEntry, document?: Document): string {
     );
     candidates.push(heading?.textContent ?? "", document.title);
   }
+  if (preferPage) candidates.push(entry.title ?? "");
   return candidates.map(cleanTitle).find((title) => title.length >= 8) ?? "";
 }
 
@@ -92,14 +112,19 @@ export type CollectedArticle = {
 };
 
 /** Fetches and reads one article. Null when no date can be found anywhere: an undated page
- *  is not recorded, so it is looked at again on the next poll. */
+ *  is not recorded, so it is looked at again on the next poll. `{ blocked }` when the page
+ *  refused the fetch and had no date either, so it is counted as blocked, not undated. Any
+ *  public host may be fetched directly, but only `sourceHost` is sent to the unlocker. */
 async function collectArticle(
   entry: SourceSampleEntry,
   entryDateSource: "feed" | "sitemap",
-): Promise<CollectedArticle | null> {
+  sourceHost: string,
+  preferPageTitle: boolean,
+): Promise<CollectedArticle | { blocked: string } | null> {
   const page = await fetchPage("Article", entry.url, null, {
     minBody: 200,
     measure: (html) => extractArticleText(html, entry.url).body.length,
+    unlockHost: sourceHost,
   });
   const finalUrl = page.finalUrl;
   let html = page.html;
@@ -121,8 +146,8 @@ async function collectArticle(
     const document = dom?.window.document;
     const feedDate = parsePublishedDate(entry.publishedAt);
     const publishedAt = feedDate ?? (document ? pagePublishedDate(document) : null);
-    if (!publishedAt) return null;
-    const title = articleTitle(entry, document);
+    if (!publishedAt) return page.via === "blocked" ? { blocked: fetchNote ?? "blocked" } : null;
+    const title = articleTitle(entry, document, preferPageTitle);
     const article =
       html !== null
         ? extractArticleText(html, finalUrl, title)
@@ -189,7 +214,26 @@ const stateSchema = z.object({
   last_modified: z.string().nullable(),
   last_fetched_at: z.string().nullable(),
   prefilled: z.boolean(),
-  seen: z.record(z.string(), z.object({ url: z.string(), bodyHash: z.string() })),
+  seen: z.record(
+    z.string(),
+    z.object({
+      url: z.string(),
+      bodyHash: z.string(),
+      // Kept for articles that were read, so the first-poll prefill can pick the 10 newest
+      // across several backlog windows. Titles and dates only, never article text.
+      article: z
+        .object({
+          title: z.string(),
+          publishedAt: z.string(),
+          dateSource: z.enum(["feed", "sitemap", "page tag"]),
+          textFrom: z.string(),
+          outcome: z.enum(["full", "short", "unreadable"]),
+          unreadableReason: z.enum(["unavailable", "teaser", "under_120", "furniture"]).nullable(),
+          fetchVia: z.enum(["direct", "unlocker", "blocked"]),
+        })
+        .optional(),
+    }),
+  ),
 });
 type SourceState = z.infer<typeof stateSchema>;
 
@@ -255,7 +299,8 @@ export type PollCounts = {
   stale: number;
   /** Fresh, but past the 10 newest on a source's first poll: recorded as seen. */
   heldByPrefill: number;
-  /** Article pages that refused a plain fetch and could not be unlocked. */
+  /** Article pages that refused a plain fetch (or came back too short) and were not unlocked.
+   *  Counted separately from `undated`, which only counts pages that loaded without a date. */
   blockedPages: number;
   full: number;
   short: number;
@@ -268,6 +313,10 @@ export type PollResult = {
   via: PageVia | null;
   firstPoll: boolean;
   backlog: string | null;
+  /** True while a first poll's backlog remains: the 10-item prefill waits for it. */
+  prefillWaiting: boolean;
+  /** One example reason for the blocked article pages, when there were any. */
+  blockedReason: string | null;
   counts: PollCounts;
   articles: CollectedArticle[];
   statePath: string;
@@ -301,6 +350,8 @@ export async function pollSource(source: SourceSpec, now = new Date()): Promise<
     via: null,
     firstPoll,
     backlog: null,
+    prefillWaiting: false,
+    blockedReason: null,
     counts,
     articles: [],
     statePath: statePath(source),
@@ -398,12 +449,20 @@ export async function pollSource(source: SourceSpec, now = new Date()): Promise<
     }
 
     const collected: CollectedArticle[] = [];
+    let blockedReason: string | null = null;
     const entryDateSource = source.mechanism === "sitemap" ? "sitemap" : "feed";
     for (let offset = 0; offset < fresh.length; offset += BATCH) {
       const chunk = await Promise.all(
         fresh.slice(offset, offset + BATCH).map(async (entry) => {
           try {
-            return await collectArticle(entry, entryDateSource);
+            return await collectArticle(
+              entry,
+              entryDateSource,
+              // A feed often lives on its own subdomain (rss.example.com) while its articles
+              // sit on www.example.com, so the unlocker check uses the shared site name.
+              hostname.replace(/^(?:www|rss|feeds?)\./, ""),
+              source.mechanism === "website",
+            );
           } catch (error) {
             console.error(`article ${entry.url}: ${(error as Error).message}`);
             return null;
@@ -413,7 +472,10 @@ export async function pollSource(source: SourceSpec, now = new Date()): Promise<
       counts.fetched += chunk.length;
       for (const article of chunk) {
         if (!article) counts.undated += 1;
-        else if (seenThisPoll.has(article.id) || state.seen[article.id]) counts.duplicates += 1;
+        else if ("blocked" in article) {
+          counts.blockedPages += 1;
+          blockedReason ??= article.blocked;
+        } else if (seenThisPoll.has(article.id) || state.seen[article.id]) counts.duplicates += 1;
         else {
           seenThisPoll.add(article.id);
           collected.push(article);
@@ -440,8 +502,23 @@ export async function pollSource(source: SourceSpec, now = new Date()): Promise<
     }
 
     for (const article of collected) {
-      state.seen[article.id] = { url: article.url, bodyHash: bodyHash(article.body) };
-      if (article.fetchVia === "blocked") counts.blockedPages += 1;
+      state.seen[article.id] = {
+        url: article.url,
+        bodyHash: bodyHash(article.body),
+        article: {
+          title: article.title,
+          publishedAt: article.publishedAt,
+          dateSource: article.dateSource,
+          textFrom: article.textFrom,
+          outcome: article.outcome,
+          unreadableReason: article.unreadableReason,
+          fetchVia: article.fetchVia,
+        },
+      };
+      if (article.fetchVia === "blocked") {
+        counts.blockedPages += 1;
+        blockedReason ??= article.fetchNote;
+      }
       if (article.outcome === "unreadable" && article.unreadableReason) {
         counts.unreadable[article.unreadableReason] =
           (counts.unreadable[article.unreadableReason] ?? 0) + 1;
@@ -449,24 +526,49 @@ export async function pollSource(source: SourceSpec, now = new Date()): Promise<
       else counts.short += 1;
     }
 
-    const recent = collected
-      .filter((article) => {
-        const at = Date.parse(article.publishedAt);
-        return at >= now.getTime() - FRESH_MS && at <= now.getTime();
-      })
-      .sort((a, b) => b.publishedAt.localeCompare(a.publishedAt));
+    const isRecent = (publishedAt: string) => {
+      const at = Date.parse(publishedAt);
+      return at >= now.getTime() - FRESH_MS && at <= now.getTime();
+    };
+    const newestFirst = (a: CollectedArticle, b: CollectedArticle) =>
+      b.publishedAt.localeCompare(a.publishedAt);
+    const recent = collected.filter((article) => isRecent(article.publishedAt)).sort(newestFirst);
     counts.stale += collected.length - recent.length;
-    const returned = firstPoll ? recent.slice(0, PREFILL) : recent;
-    counts.heldByPrefill = recent.length - returned.length;
+    let returned = recent;
+    let prefillWaiting = false;
+    if (firstPoll && backlog !== null) {
+      // As in the product, the prefill waits until a poll reads the whole backlog.
+      prefillWaiting = true;
+      returned = [];
+      counts.heldByPrefill = recent.length;
+    } else if (firstPoll) {
+      // The prefill: the 10 newest fresh articles this source has recorded, this poll's and
+      // those read in earlier backlog windows. Earlier ones carry no text preview.
+      const thisPoll = new Set(collected.map((article) => article.id));
+      const earlier: CollectedArticle[] = Object.entries(state.seen).flatMap(([id, seen]) =>
+        seen.article && !thisPoll.has(id) && isRecent(seen.article.publishedAt)
+          ? [{ id, url: seen.url, finalUrl: seen.url, text: "", body: "", fetchNote: null, ...seen.article }]
+          : [],
+      );
+      const pool = [...recent, ...earlier].sort(newestFirst);
+      returned = pool.slice(0, PREFILL);
+      counts.heldByPrefill = pool.length - returned.length;
+    }
 
     // Validators are kept only when this poll read everything the document offered.
     const complete = backlog === null && page.via === "direct";
     state.etag = complete ? page.etag : null;
     state.last_modified = complete ? page.lastModified : null;
     state.last_fetched_at = now.toISOString();
-    state.prefilled = true;
+    state.prefilled = !prefillWaiting;
     saveState(source, state);
-    return result("ok", { via: page.via, backlog, articles: returned });
+    return result("ok", {
+      via: page.via,
+      backlog,
+      prefillWaiting,
+      blockedReason,
+      articles: returned,
+    });
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     console.error(`source ${source.target}: ${reason}`);

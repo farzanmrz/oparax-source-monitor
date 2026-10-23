@@ -9,6 +9,7 @@ import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { isIP } from "node:net";
 import { Readable } from "node:stream";
+import { gunzipSync } from "node:zlib";
 import type { SourceSampleEntry } from "./types.js";
 import { fetchPage, type PageVia } from "./unlocker.js";
 
@@ -84,7 +85,7 @@ export async function fetchSafeSourceWithFinalUrl(
  *  validating DNS and then using global fetch would let a second DNS lookup connect to a
  *  rebinding answer. `https.request` keeps the URL hostname as SNI and for certificate
  *  verification while its socket connects only to this address. */
-export async function fetchPinnedSource(
+async function fetchPinnedSource(
   endpoint: string,
   url: URL,
   signal?: AbortSignal,
@@ -327,11 +328,12 @@ function isPublicIpAddress(address: string): boolean {
   );
 }
 
-/** Exported so `extractListingSample` and `isSafeDiscoveredUrl` can reject private,
- *  loopback and link-local hosts before a fetch. */
+/** Exported so listing.ts and section.ts can reject links to private, loopback and
+ *  link-local hosts before a fetch; `isSafeDiscoveredUrl`, `isPublicHttpUrl` and
+ *  `extractListingSample` in this file use it too. */
 export function isPrivateHostname(hostname: string): boolean {
   // URL.hostname keeps IPv6 literals bracketed; strip so the prefix tests below apply. Also
-  // strip a trailing FQDN dot, found in review: "localhost." (a valid absolute hostname per
+  // strip a trailing FQDN dot: "localhost." (a valid absolute hostname per
   // DNS) passed both the exact-match and suffix checks below unstripped, a second route to
   // the same hole a direct "localhost." paste already had.
   const host = hostname
@@ -345,18 +347,21 @@ export function isPrivateHostname(hostname: string): boolean {
   return isIP(host) !== 0 && !isPublicIpAddress(host);
 }
 
-/** Guards a URL that came from site-controlled content (a sitemap index's `<loc>`) before
- *  this process fetches it: http(s) only, same site as the host being discovered (exact
- *  hostname, or a sub/parent domain of it, since apex and `www.` cross-reference each other
- *  constantly), and never a private/loopback/link-local literal. Without this a hostile
- *  site's sitemap index can point at an internal address and have the process fetch and parse
- *  it from inside its own network. */
+/** The check for a URL that may lead to any site (a link a person posted, an article on
+ *  another host): http(s) only, and never a private/loopback/link-local host. It has no
+ *  same-site rule; `isSafeDiscoveredUrl` below adds that for site-controlled content. */
 export function isPublicHttpUrl(url: URL): boolean {
   return (
     (url.protocol === "http:" || url.protocol === "https:") && !isPrivateHostname(url.hostname)
   );
 }
 
+/** Guards a URL that came from site-controlled content (a sitemap index's `<loc>`) before
+ *  this process fetches it: http(s) only, same site as the host being discovered (exact
+ *  hostname, or a sub/parent domain of it, since apex and `www.` cross-reference each other
+ *  constantly), and never a private/loopback/link-local literal. Without this a hostile
+ *  site's sitemap index can point at an internal address and have the process fetch and parse
+ *  it from inside its own network. */
 export function isSafeDiscoveredUrl(candidate: string, expectedHostname: string): boolean {
   let url: URL;
   try {
@@ -396,12 +401,12 @@ export async function urlExists(url: string): Promise<boolean> {
 }
 
 /** Any response at all counts as reachable, even a 404 means the network layer worked.
- *  Only a genuine transport-level error (DNS/connection failure) counts as unreachable. Found
- *  live (2026-08-06): `sport.es` (bare apex) is unreachable outright (`fetch` throws before
+ *  Only a genuine transport-level error (DNS/connection failure) counts as unreachable. Seen
+ *  live: `sport.es` (bare apex) is unreachable outright (`fetch` throws before
  *  any HTTP response exists) while `www.sport.es`, the exact same site, resolves fine.
  *
  *  A 15s timeout is NOT treated as unreachable because a slow response still means something is
- *  there. Found in review: the fetcher rethrows a timeout as a
+ *  there. The fetcher rethrows a timeout as a
  *  plain `Error` with the message `"... timed out after 15s"`, indistinguishable from a real
  *  connection failure by `.name` alone once caught here. A slow-but-real apex site would
  *  otherwise get misdiverted to a `www.` host that may not even exist, the opposite of what
@@ -451,7 +456,7 @@ function comparableHostname(hostname: string): string {
   return hostname.toLowerCase().replace(/^www\./, "");
 }
 
-export function extractAnchors(html: string): { href: string; text: string }[] {
+function extractAnchors(html: string): { href: string; text: string }[] {
   const anchors: { href: string; text: string }[] = [];
   let open: { href: string; contentStart: number } | null = null;
   let cursor = 0;
@@ -504,6 +509,43 @@ export async function readHtmlWithinLimit(res: Response, endpoint: string): Prom
     }
     html += decoder.decode(value, { stream: true });
   }
+}
+
+/** Reads a body like `readHtmlWithinLimit`, but as bytes, and gunzips it when it starts with
+ *  the gzip magic number (a `.xml.gz` sitemap, or a gzip content-type). Checking the bytes
+ *  rather than the name matters: some sites serve a `.gz` URL as plain XML. The decompressed
+ *  text is held to the same 5 MB cap. */
+export async function readBodyWithinLimit(res: Response, endpoint: string): Promise<string> {
+  const contentLength = Number(res.headers.get("content-length") ?? "0");
+  if (contentLength > MAX_HTML_LENGTH) {
+    await res.body?.cancel();
+    throw new Error(`Source ${endpoint} declared body too large (${contentLength} bytes)`);
+  }
+  const reader = res.body?.getReader();
+  if (!reader) return "";
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    bytes += value.byteLength;
+    if (bytes > MAX_HTML_LENGTH) {
+      await reader.cancel();
+      throw new Error(`Source ${endpoint} body too large (${bytes} bytes)`);
+    }
+    chunks.push(value);
+  }
+  let body = Buffer.concat(chunks);
+  if (body.length >= 2 && body[0] === 0x1f && body[1] === 0x8b) {
+    try {
+      body = gunzipSync(body, { maxOutputLength: MAX_HTML_LENGTH });
+    } catch (error) {
+      throw new Error(
+        `Source ${endpoint} gzip body unreadable or too large (${(error as Error).message})`,
+      );
+    }
+  }
+  return new TextDecoder().decode(body);
 }
 
 export function stripTrackingParameters(url: URL): void {
@@ -604,18 +646,18 @@ function sortByNewsKeyword(candidates: string[]): string[] {
 
 /** Cheap non-emptiness probe for a sitemap-shaped URL. Every real `<urlset>` or
  *  `<sitemapindex>` entry is wrapped in a `<loc>` tag, so a body with none is either a
- *  genuinely empty sitemap or not a sitemap at all. Found live (2026-08-06): `urlExists` alone
+ *  genuinely empty sitemap or not a sitemap at all. Seen live: `urlExists` alone
  *  can't tell an empty `<urlset/>` (a real, 200-OK, non-HTML response) from a populated one:
  *  90min.com declares an empty `news-sitemap.xml` in robots.txt that would otherwise win and
  *  permanently shadow the working hardcoded `/sitemap.xml` fallback below. Deliberately not a
  *  full XML parse (that's `fetchSitemapSample` in sitemap.ts, run once later by the caller on
- *  whichever URL wins); importing it here would be circular (sitemap.ts already imports
- *  `isSafeDiscoveredUrl` from this module). */
+ *  whichever URL wins); a cheap probe is enough to tell empty from populated. A gzipped
+ *  sitemap is decompressed first. */
 async function hasSitemapEntries(url: string): Promise<boolean> {
   try {
     const res = await sourceFetch(url, url);
     if (!res.ok || !isNotHtmlResponse(res)) return false;
-    return /<loc[\s>]/i.test(await res.text());
+    return /<loc[\s>]/i.test(await readBodyWithinLimit(res, url));
   } catch {
     return false;
   }
@@ -624,7 +666,8 @@ async function hasSitemapEntries(url: string): Promise<boolean> {
 /** Tries robots.txt-declared sitemap candidates in priority order, returning the first that
  *  passes the same SSRF guard `fetchLeafEntries` applies to sitemap-index `<loc>` entries (a
  *  robots.txt-declared URL is equally site-controlled, untrusted content, so redirects are
- *  refused outright for the same reason, never followed), then genuinely has entries. Never
+ *  followed only within the same site, each hop checked, up to 20), then genuinely has
+ *  entries. Never
  *  throws: a missing or unreachable robots.txt just means no candidates. */
 export async function discoverFromRobots(
   origin: string,
@@ -662,11 +705,11 @@ export async function discoverFromRobots(
  *  but whose bare apex works also resolves correctly, not just the reverse. Returns
  *  `inputUrl` UNCHANGED when neither the toggle nor the original beats the reachability
  *  check, including when toggling isn't meaningful at all (an IP-literal host, where the
- *  hostname setter silently no-ops rather than throwing, verified live; or a bare `"www."`
+ *  hostname setter silently no-ops rather than throwing; or a bare `"www."`
  *  host, where stripping leaves an empty string). Callers always get a valid URL back, never
  *  null; the rest of discovery correctly falls through to "nothing found" on a URL that's
  *  genuinely unreachable either way. At most 2 reachability checks total for any input, by
- *  construction, never more, no recursion. Found in review: the one-directional version's
+ *  construction, never more, no recursion. The one-directional version's
  *  guard order meant a `www.`-prefixed input paid ZERO reachability checks (the retry only
  *  ever fired for non-`www.` hosts); this version always pays at least 1, since the whole
  *  point is protecting `www.` inputs too, an accepted, necessary cost of bidirectionality,
@@ -700,7 +743,7 @@ export type DiscoveryStep = (step: string, result: string) => void;
  *  then the domain root, then common feed paths. The HTML listing is last.
  *
  *  `resolveReachableInputUrl` resolves the host first before any of the above runs.
- *  `skipSitemaps` starts at the exact page, for a caller that has already found the site's
+ *  `skipSitemaps` starts at the exact page; a caller uses it after finding that the site's
  *  sitemap cannot be scoped to the section it wants. `onStep` reports each step as it runs. */
 export async function discoverChangeDetection(
   inputUrl: URL,
@@ -847,11 +890,13 @@ export async function discoverChangeDetection(
   return { mechanism: null, ...evidence() };
 }
 
-/** The shorter admission the product uses today: the input URL as a feed, the page's RSS and
- *  Atom link tags, the common feed paths, else a "website" listing when the page has 5 or
- *  more article-shaped links. No sitemaps. */
+/** The shorter feed or listing check the product uses today: the input URL as a feed, the
+ *  page's RSS and Atom link tags, the common feed paths, else a "website" listing when the
+ *  page has 5 or more article-shaped links. No sitemaps. `page` passes HTML the caller has
+ *  already fetched for this URL, so it is not fetched (or unlocked) a second time. */
 export async function discoverFeedOrListing(
   input: URL,
+  page?: { html: string; finalUrl: string },
 ): Promise<
   | { kind: "rss"; target: string; name: string }
   | { kind: "website"; target: string; name: string }
@@ -864,7 +909,9 @@ export async function discoverFeedOrListing(
   let finalUrl = input.toString();
   const candidates = new Set<string>([input.toString()]);
   try {
-    const fetched = await fetchPage("Source admission", input.toString(), input.hostname);
+    const fetched = page
+      ? { html: page.html, finalUrl: page.finalUrl, via: "direct" as const }
+      : await fetchPage("Feed or listing check", input.toString(), input.hostname);
     finalUrl = fetched.finalUrl;
     if (fetched.html !== null && fetched.via !== "blocked") {
       html = fetched.html;

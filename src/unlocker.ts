@@ -1,11 +1,15 @@
 // src/unlocker.ts
 //
-// The page fetch every other module goes through: a plain direct fetch first (Tier 1), then
-// Bright Data's Web Unlocker (Tier 2) when the direct fetch fails or comes back blocked or
+// The page fetch for pages worth unlocking: a plain direct fetch first (Tier 1), then Bright
+// Data's Web Unlocker (Tier 2) when the direct fetch fails or comes back blocked or
 // suspiciously short. Restored from Oparax's earlier poller, which ran this same two-step chain
-// for article bodies; here it also covers listing, sitemap and discovery page fetches. The
-// unlocker is off unless BRIGHTDATA_API_KEY and BRIGHTDATA_ZONE are both set, and a blocked
-// page is reported as blocked, never as an empty result.
+// for article bodies. Here it serves article pages, the polled feed, listing page or sitemap,
+// sitemap index children, the section page and home page during discovery, and the home page
+// in section search. Cheap existence probes fetch directly and never unlock: robots.txt, the
+// well-known sitemap and feed paths, the empty-sitemap probe, the reachability check, and the
+// feed check in discoverFeedOrListing (feed.ts's fetchFeedSample). The unlocker is off unless
+// BRIGHTDATA_API_KEY and BRIGHTDATA_ZONE are both set, and a blocked page is reported as
+// blocked, never as an empty result.
 
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -13,7 +17,7 @@ import {
   fetchSafeSourceWithFinalUrl,
   isPublicHttpUrl,
   isSafeDiscoveredUrl,
-  readHtmlWithinLimit,
+  readBodyWithinLimit,
 } from "./fetch.js";
 
 const BRIGHTDATA_REQUEST_URL = "https://api.brightdata.com/request";
@@ -65,7 +69,7 @@ export function unlockerUsage(): { used: number; cap: number } {
 /** Web Unlocker API contract: POST https://api.brightdata.com/request, Bearer auth, JSON body
  *  { zone, url, format: "raw" }, response body is the raw target-site HTML (not JSON). Each
  *  successful request is billed by Bright Data to the key's owner. */
-export async function fetchViaUnlocker(url: string): Promise<string> {
+async function fetchViaUnlocker(url: string): Promise<{ html: string; status: number }> {
   const apiKey = process.env.BRIGHTDATA_API_KEY?.trim();
   const zone = process.env.BRIGHTDATA_ZONE?.trim();
   if (!apiKey || !zone) throw new Error(UNLOCKER_OFF);
@@ -79,7 +83,7 @@ export async function fetchViaUnlocker(url: string): Promise<string> {
     const text = (await res.text().catch(() => "")).replace(/\s+/g, " ").trim();
     throw new Error(`Unlocker ${res.status}: ${text.slice(0, 200)}`);
   }
-  return readHtmlWithinLimit(res, url);
+  return { html: await readBodyWithinLimit(res, url), status: res.status };
 }
 
 export type PageVia = "direct" | "unlocker" | "blocked";
@@ -104,11 +108,15 @@ export type PageOptions = {
   /** Sent on the direct fetch only, for conditional requests. A 304 is returned untouched. */
   headers?: HeadersInit;
   /** Escalate when the body measures under this many characters (200 in the earlier poller:
-   *  a "please enable JS" stub or a challenge page, the "curtain, not wall" case). */
+   *  a "please enable JS" stub or a challenge page). An unlocked body is measured the same way. */
   minBody?: number;
   /** How to measure the body for `minBody`. Defaults to the raw HTML length; article fetches
    *  measure the extracted text instead, as the earlier poller did. */
   measure?: (html: string) => number;
+  /** The host an unlocked fetch must stay on when `expectedHostname` is null. Article pages
+   *  may be fetched directly from any public host, but only the source's own host is sent to
+   *  the unlocker, so a third-party link in a feed never runs up the key owner's bill. */
+  unlockHost?: string;
 };
 
 /** Fetches one page: direct first, the unlocker when the direct fetch throws, answers
@@ -121,6 +129,7 @@ export async function fetchPage(
 ): Promise<PageResult> {
   let directHtml: string | null = null;
   let escalation: string;
+  const measure = options.measure ?? ((html: string) => html.length);
   let base: Omit<PageResult, "html" | "via" | "reason" | "trigger"> = {
     finalUrl: url,
     status: null,
@@ -152,8 +161,8 @@ export async function fetchPage(
       await fetched.res.body?.cancel();
       return { ...base, html: null, via: "direct", reason: `HTTP ${status}`, trigger: null };
     } else {
-      directHtml = await readHtmlWithinLimit(fetched.res, url);
-      const size = options.minBody ? (options.measure ?? ((h) => h.length))(directHtml) : 0;
+      directHtml = await readBodyWithinLimit(fetched.res, url);
+      const size = options.minBody ? measure(directHtml) : 0;
       if (!options.minBody || size >= options.minBody) {
         return { ...base, html: directHtml, via: "direct", reason: null, trigger: null };
       }
@@ -181,17 +190,25 @@ export async function fetchPage(
   } catch {
     return blocked("invalid URL");
   }
+  const unlockHost = expectedHostname ?? options.unlockHost ?? null;
   const safe =
-    expectedHostname === null ? isPublicHttpUrl(parsed) : isSafeDiscoveredUrl(url, expectedHostname);
+    unlockHost === null ? isPublicHttpUrl(parsed) : isSafeDiscoveredUrl(url, unlockHost);
   if (!safe) return blocked("URL not eligible for the unlocker");
   if (!isUnlockerConfigured()) return blocked(UNLOCKER_OFF);
   if (unlockerCalls >= unlockerCap()) return blocked(UNLOCKER_CAP_REACHED);
   unlockerCalls += 1;
   try {
-    const html = await fetchViaUnlocker(url);
+    const { html, status } = await fetchViaUnlocker(url);
+    // An empty or challenge body that came back through the unlocker is not a success either.
+    const size = options.minBody ? measure(html) : html.length;
+    if ((options.minBody && size < options.minBody) || html.length === 0) {
+      return blocked(
+        `unlocker returned ${size} characters, under the ${options.minBody ?? 1} minimum`,
+      );
+    }
     return {
       finalUrl: url,
-      status: 200,
+      status,
       contentType: null,
       etag: null,
       lastModified: null,

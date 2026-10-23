@@ -35,7 +35,7 @@ export type SectionCandidate = {
   score: number;
   matched: string[];
   linkTexts: string[];
-  /** Recent sitemap entries under this path; 0 when the site has no usable sitemap. */
+  /** Sampled sitemap article entries under this path; 0 when the site has no usable sitemap. */
   entryCount: number;
   from: ("navigation" | "page body" | "sitemap")[];
 };
@@ -59,9 +59,11 @@ export function tokens(text: string): string[] {
     .filter(Boolean);
 }
 
-/** Whole-token match, with a trailing "s" folded so "card" meets "cards". */
+/** Whole-token match, with a plural "s" folded so "card" meets "cards". Only words longer than
+ *  4 characters that do not end in "ss" or "ws" are folded, so "news" stays "news". */
 function sameWord(a: string, b: string): boolean {
-  const fold = (word: string) => (word.length > 3 ? word.replace(/s$/, "") : word);
+  const fold = (word: string) =>
+    word.length > 4 && !/(?:ss|ws)$/.test(word) ? word.replace(/s$/, "") : word;
   return a === b || fold(a) === fold(b);
 }
 

@@ -96,9 +96,9 @@ async function resolveSource(
       return !date || Date.parse(date) >= Date.now() - CURRENT_DAYS * 86_400_000;
     }).length;
     if (prefix === "/") {
-      say(`  site root: all ${sample.length} recent article entries in the sitemap are in scope`);
+      say(`  site root: all ${sample.length} sampled article entries in the sitemap are in scope`);
     } else {
-      say(`  ${matches} of ${sample.length} recent sitemap entries sit under ${prefix} (article pages only)`);
+      say(`  ${matches} of ${sample.length} sampled sitemap entries sit under ${prefix} (article pages only)`);
     }
     if (matches > 0) say(`  ${current} of them dated in the last ${CURRENT_DAYS} days or undated`);
     if (sample.length === 0 || matches === 0 || current === 0) {
@@ -129,11 +129,17 @@ async function resolveSource(
     return { target: found.listingUrl, mechanism: "website", pathPrefix: null };
   }
   if (found.exactPageVia !== "blocked") {
-    // The product's current admission reads listings with listing.ts, which also accepts
-    // id-style article links (BBC's /news/articles/c0abc123) that the older listing step skips.
-    const admitted = await discoverFeedOrListing(url);
+    // The product's current feed or listing check reads listings with listing.ts, which also
+    // accepts id-style article links (BBC's /news/articles/c0abc123) that the older listing
+    // step skips. It reuses the page HTML discovery already fetched.
+    const admitted = await discoverFeedOrListing(
+      url,
+      found.exactPageHtml && found.exactPageFinalUrl
+        ? { html: found.exactPageHtml, finalUrl: found.exactPageFinalUrl }
+        : undefined,
+    );
     onStep(
-      "current admission (feed, link tags, feed paths, listing links)",
+      "current feed or listing check (feed, link tags, feed paths, listing links)",
       admitted ? `${admitted.kind} ${admitted.target}` : "none",
     );
     if (admitted?.kind === "rss") {
@@ -179,11 +185,25 @@ function printPoll(label: string, poll: PollResult): void {
   say(`  fetched via ${poll.via}; ${c.entries} entries, ${c.inScope} in scope, ${c.alreadySeen} already seen, ${c.duplicates} duplicates`);
   if (poll.backlog) say(`  backlog: ${poll.backlog}`);
   const unreadable = Object.entries(c.unreadable).map(([reason, n]) => `${n} ${reason}`).join(", ");
-  say(`  ${c.fetched} article pages fetched: ${c.full} full, ${c.short} short, ${unreadable || "0"} unreadable, ${c.undated} undated`);
-  if (c.blockedPages) say(`  ${c.blockedPages} article pages blocked or too short and not unlocked`);
+  say(`  ${c.fetched} article ${c.fetched === 1 ? "page" : "pages"} fetched: ${c.full} full, ${c.short} short, ${unreadable || "0"} unreadable, ${c.undated} undated`);
+  if (c.blockedPages) {
+    say(
+      `  ${c.blockedPages} article ${c.blockedPages === 1 ? "page" : "pages"} blocked or too short and not unlocked${
+        poll.blockedReason ? ` (for example: ${poll.blockedReason})` : ""
+      }`,
+    );
+  }
   say(`  ${c.stale} older than 2 days (recorded, not shown); ${c.heldByPrefill} held back by the 10-item first-poll prefill`);
+  if (poll.prefillWaiting) {
+    say("  First poll is reading a backlog: the 10-item prefill waits until a poll reads all of it, so nothing is returned yet.");
+    return;
+  }
   if (poll.articles.length === 0) {
-    say(c.fetched === 0 && c.alreadySeen > 0 ? "  No new articles: everything listed was already seen." : "  No new articles to show.");
+    if (c.blockedPages > 0) {
+      say("  No article could be read: the pages refused a plain fetch. This is not \"no new articles\".");
+    } else {
+      say(c.fetched === 0 && c.alreadySeen > 0 ? "  No new articles: everything listed was already seen." : "  No new articles to show.");
+    }
     return;
   }
   say(`  ${poll.articles.length} new article${poll.articles.length === 1 ? "" : "s"}, newest first${poll.articles.length > 5 ? " (showing 5)" : ""}:`);
@@ -194,10 +214,11 @@ function printPoll(label: string, poll: PollResult): void {
     say(`    ${article.url}`);
     say(`    text from ${article.textFrom}, fetched ${article.fetchVia}${article.fetchNote ? ` (${article.fetchNote})` : ""}`);
     if (article.text) say(`    "${preview(article.text.slice(article.title.length).trim() || article.text)}"`);
+    else say("    (read in an earlier poll; no preview kept)");
   }
 }
 
-async function pickSection(site: string, interest: string, yes: boolean): Promise<string | null> {
+async function pickSection(site: string, interest: string, yes: boolean): Promise<string> {
   say(`Looking for the part of ${site} that matches "${interest}"`);
   const search = await findSections(site, interest);
   say(`  interest words: ${search.interestWords.join(", ")}`);
@@ -206,7 +227,7 @@ async function pickSection(site: string, interest: string, yes: boolean): Promis
   );
   say(
     search.sitemap
-      ? `  sitemap: ${search.sitemap.url}, ${search.sitemap.entries} recent entries`
+      ? `  sitemap: ${search.sitemap.url}, ${search.sitemap.entries} article entries sampled`
       : "  sitemap: none found",
   );
   say(`  ${search.considered} candidate sections considered`);
@@ -265,9 +286,7 @@ async function main(): Promise<void> {
       say(`--site needs --interest "<words>"\n\n${USAGE}`);
       return;
     }
-    const picked = await pickSection(args.site, args.interest, args.yes === true);
-    if (!picked) return;
-    sectionUrl = picked;
+    sectionUrl = await pickSection(args.site, args.interest, args.yes === true);
   } else if (typeof args.url === "string") {
     sectionUrl = args.url;
   } else {
