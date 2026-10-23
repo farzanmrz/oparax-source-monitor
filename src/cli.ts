@@ -171,7 +171,7 @@ function preview(text: string): string {
 }
 
 function printPoll(label: string, poll: PollResult): void {
-  say(`\n${label}: ${poll.status}${poll.reason ? ` (${poll.reason})` : ""}${poll.firstPoll ? ", first poll of this source" : ""}`);
+  say(`\n${label}: ${poll.status}${poll.reason ? ` (${poll.reason})` : ""}${poll.firstPoll ? (poll.polledBefore ? ", backlog still being read (prefill continues)" : ", first poll of this source") : ""}`);
   if (poll.status === "not_modified") {
     say("  HTTP 304 Not Modified: nothing changed since the last poll, nothing fetched.");
     return;
@@ -194,10 +194,6 @@ function printPoll(label: string, poll: PollResult): void {
     );
   }
   say(`  ${c.stale} older than 2 days (recorded, not shown); ${c.heldByPrefill} held back by the 10-item first-poll prefill`);
-  if (poll.prefillWaiting) {
-    say("  First poll is reading a backlog: the 10-item prefill waits until a poll reads all of it, so nothing is returned yet.");
-    return;
-  }
   if (poll.articles.length === 0) {
     if (c.blockedPages > 0) {
       say("  No article could be read: the pages refused a plain fetch. This is not \"no new articles\".");

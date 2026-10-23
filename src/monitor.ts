@@ -232,6 +232,8 @@ const stateSchema = z.object({
           fetchVia: z.enum(["direct", "unlocker", "blocked"]),
         })
         .optional(),
+      // Set once an article has been returned, so nothing is shown twice across polls.
+      shown: z.boolean().optional(),
     }),
   ),
 });
@@ -312,9 +314,9 @@ export type PollResult = {
   reason: string | null;
   via: PageVia | null;
   firstPoll: boolean;
+  /** True when this source was polled before (a first-poll prefill still in progress). */
+  polledBefore: boolean;
   backlog: string | null;
-  /** True while a first poll's backlog remains: the 10-item prefill waits for it. */
-  prefillWaiting: boolean;
   /** One example reason for the blocked article pages, when there were any. */
   blockedReason: string | null;
   counts: PollCounts;
@@ -327,6 +329,7 @@ export type PollResult = {
 export async function pollSource(source: SourceSpec, now = new Date()): Promise<PollResult> {
   const state = loadState(source);
   const firstPoll = !state.prefilled;
+  const polledBefore = state.last_fetched_at !== null;
   const counts: PollCounts = {
     entries: 0,
     inScope: 0,
@@ -349,8 +352,8 @@ export async function pollSource(source: SourceSpec, now = new Date()): Promise<
     reason: null,
     via: null,
     firstPoll,
+    polledBefore,
     backlog: null,
-    prefillWaiting: false,
     blockedReason: null,
     counts,
     articles: [],
@@ -444,8 +447,9 @@ export async function pollSource(source: SourceSpec, now = new Date()): Promise<
       // Undated pages are not recorded, so rotating windows prevent them blocking later links.
       const windows = Math.ceil(fresh.length / WINDOW);
       const window = Math.floor(now.getTime() / 60_000) % windows;
-      backlog = `${fresh.length} new links, reading window ${window + 1} of ${windows}`;
+      const total = fresh.length;
       fresh = fresh.slice(window * WINDOW, window * WINDOW + WINDOW);
+      backlog = `${total} new links, reading window ${window + 1} of ${windows}; ${total - fresh.length} links left, read on the next poll`;
     }
 
     const collected: CollectedArticle[] = [];
@@ -535,18 +539,14 @@ export async function pollSource(source: SourceSpec, now = new Date()): Promise<
     const recent = collected.filter((article) => isRecent(article.publishedAt)).sort(newestFirst);
     counts.stale += collected.length - recent.length;
     let returned = recent;
-    let prefillWaiting = false;
-    if (firstPoll && backlog !== null) {
-      // As in the product, the prefill waits until a poll reads the whole backlog.
-      prefillWaiting = true;
-      returned = [];
-      counts.heldByPrefill = recent.length;
-    } else if (firstPoll) {
-      // The prefill: the 10 newest fresh articles this source has recorded, this poll's and
-      // those read in earlier backlog windows. Earlier ones carry no text preview.
+    if (firstPoll) {
+      // The prefill. The product waits until the whole backlog is read before returning its
+      // first 10; this demo returns, on each poll until the backlog is done, the 10 newest
+      // fresh articles recorded for the source so far that have not been shown yet, this
+      // poll's and those read in earlier windows (which carry no text preview).
       const thisPoll = new Set(collected.map((article) => article.id));
       const earlier: CollectedArticle[] = Object.entries(state.seen).flatMap(([id, seen]) =>
-        seen.article && !thisPoll.has(id) && isRecent(seen.article.publishedAt)
+        seen.article && !seen.shown && !thisPoll.has(id) && isRecent(seen.article.publishedAt)
           ? [{ id, url: seen.url, finalUrl: seen.url, text: "", body: "", fetchNote: null, ...seen.article }]
           : [],
       );
@@ -554,18 +554,22 @@ export async function pollSource(source: SourceSpec, now = new Date()): Promise<
       returned = pool.slice(0, PREFILL);
       counts.heldByPrefill = pool.length - returned.length;
     }
+    for (const article of returned) {
+      const seen = state.seen[article.id];
+      if (seen) seen.shown = true;
+    }
 
     // Validators are kept only when this poll read everything the document offered.
     const complete = backlog === null && page.via === "direct";
     state.etag = complete ? page.etag : null;
     state.last_modified = complete ? page.lastModified : null;
     state.last_fetched_at = now.toISOString();
-    state.prefilled = !prefillWaiting;
+    // Prefilled once a poll finishes with no backlog left.
+    state.prefilled = state.prefilled || backlog === null;
     saveState(source, state);
     return result("ok", {
       via: page.via,
       backlog,
-      prefillWaiting,
       blockedReason,
       articles: returned,
     });
